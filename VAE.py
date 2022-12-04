@@ -1,6 +1,6 @@
-import numpy as np
 import torch
 from torch import nn
+from numpy.random import default_rng
 
 class Encoder(nn.Module):
     """
@@ -12,6 +12,7 @@ class Encoder(nn.Module):
         z_dim (int): number of latent variables
         layer_size (list): number of hidden units for each encoder layer
         """
+        super(Encoder, self).__init__()
         self.n_layers = len(layer_sizes)
 
         self.model_layers = nn.ModuleList()
@@ -20,7 +21,7 @@ class Encoder(nn.Module):
         self.model_layers.append(nn.Linear(n_features, layer_sizes[0]))
         self.model_layers.append(nn.ReLU())
         
-        if(self.n_layers>2):
+        if(self.n_layers>1):
             for i_layer in range(self.n_layers-1):
                 self.model_layers.append(nn.Linear(layer_sizes[i_layer], layer_sizes[i_layer+1]))
                 self.model_layers.append(nn.ReLU())
@@ -52,7 +53,9 @@ class Decoder(nn.Module):
         layer_size (list): number of hidden units for each encoder layer
         is_autoregressive (bool): 
         """
+        super(Decoder, self).__init__()
         n_layers = len(layer_sizes)
+        layer_sizes.reverse() # for symmetric decoder
         self.is_autoregressive = is_autoregressive
 
         self.model_layers = nn.ModuleList()
@@ -61,7 +64,7 @@ class Decoder(nn.Module):
         self.model_layers.append(nn.Linear(z_dim, layer_sizes[0]))
         self.model_layers.append(nn.ReLU())
         
-        if(n_layers>2):
+        if(n_layers>1):
             for i_layer in range(n_layers-1):
                 self.model_layers.append(nn.Linear(layer_sizes[i_layer], layer_sizes[i_layer+1]))
                 self.model_layers.append(nn.ReLU())
@@ -87,7 +90,7 @@ class Decoder(nn.Module):
     def autoregressive_mask(self):
         pass
 
-    def forward(self):
+    def forward(self, x):
         for model_layer in self.model_layers:
             x = model_layer(x)
         
@@ -116,19 +119,20 @@ class VAE(nn.Module):
         is_conditional (bool):
         seed (int): seed for random number generator
         """
+        super(VAE, self).__init__()
         self.input_dim = n_features
         self.z_dim = z_dim
         self.generative_model = generative_model
         self.is_autoregressive = is_autoregressive
         self.is_conditional = is_conditional
 
-        self.rng = np.random.default_rng(seed)
+        self.rng = default_rng(seed)
 
         # define encoder network
         self.encoder = Encoder(n_features, z_dim, layer_sizes)
 
         # define decoder network
-        self.decoder = Decoder(n_features, z_dim, layer_sizes, generative_model, is_autoregressive)
+        self.decoder = Decoder(z_dim, n_features, layer_sizes, generative_model, is_autoregressive)
 
         # latent batch offset vector
         if(n_batches>1):
@@ -139,22 +143,34 @@ class VAE(nn.Module):
     def generate_data(self, params):
         if(self.generative_model == 'bernoulli'):
             return self.rng.binomial(n=1, p=params[0])
+        
         elif(self.generative_model == 'gaussian'):
-            return self.rng.normal(loc=params[0], scale=params[1])
+            return torch.normal(mean=params[0], std=params[1])
+        
         elif(self.generative_model == 'nb'):
             return self.rng.negative_binomial(n=params[0], p=params[1])
 
-    def elbo_loss(self, means, vars, x, x_out):
+    def calculate_nll(self, x, x_out, params):
+        if(self.generative_model == 'bernoulli'):
+            return torch.sum(x * torch.log(x_out) + (1-x) * torch.log(1-x_out))
+        
+        elif(self.generative_model == 'gaussian'):
+            return torch.exp(-0.5*(x - params[0])**2 / params[1]) / (2*params[1]*torch.pi)
+        
+        elif(self.generative_model == 'nb'):
+            pass
+
+    def elbo_loss(self, z_means, z_vars, generative_params, x, x_out):
         """
         """
         # KL divergence between true and approximate prior
         # equivalent to a regularization term
         # see eq. 10 from Kingma and Welling, 2014
-        KL_divergence = 0.5 * torch.sum(1 + torch.log(vars**2) - means**2 - vars**2)
+        KL_divergence = 0.5 * torch.sum(1 + torch.log(vars**2) - z_means**2 - z_vars**2)
 
         # negative log-likelihood of generated data
         # equivalent to reconstruction loss
-        nll = torch.log(x_out)
+        nll = self.calculate_nll(x, x_out, generative_params)
 
         # negative because we are minimizing loss
         return -(KL_divergence + nll)
@@ -167,7 +183,7 @@ class VAE(nn.Module):
         # multivariate Gaussian prior
         # generate means and variances for latent variables z
         (means, vars) = self.encoder(x)
-        z = means + vars * self.rng.normal(0, 1, size=x.shape[0]) + self.batch_offset
+        z = means + vars * torch.normal(mean=0, std=1, size=vars.shape) #+ self.batch_offset
 
         # append condition labels if relevant (may be continuous)
         if(self.is_conditional):
@@ -183,4 +199,3 @@ class VAE(nn.Module):
         elbo = self.elbo_loss(means, vars, x, x_out)
 
         return x_out, elbo
-
