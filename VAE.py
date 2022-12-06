@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-from numpy.random import default_rng
 
 class Encoder(nn.Module):
     """
@@ -35,9 +34,9 @@ class Encoder(nn.Module):
             x = model_layer(x)
 
         means = self.output_means(x)
-        vars = self.output_vars(x)
+        logvars = self.output_vars(x)
 
-        return (means, vars)
+        return (means, logvars)
 
 class Decoder(nn.Module):
     """
@@ -126,8 +125,6 @@ class VAE(nn.Module):
         self.is_autoregressive = is_autoregressive
         self.is_conditional = is_conditional
 
-        self.rng = default_rng(seed)
-
         # define encoder network
         self.encoder = Encoder(n_features, z_dim, layer_sizes)
 
@@ -142,38 +139,39 @@ class VAE(nn.Module):
 
     def generate_data(self, params):
         if(self.generative_model == 'bernoulli'):
-            return self.rng.binomial(n=1, p=params[0])
+            return torch.bernoulli(input=params[0])
         
         elif(self.generative_model == 'gaussian'):
-            return torch.normal(mean=params[0], std=params[1])
+            return torch.normal(mean=params[0], std=torch.exp(0.5*params[1]))
         
         elif(self.generative_model == 'nb'):
-            return self.rng.negative_binomial(n=params[0], p=params[1])
+            return torch.negative_binomial(n=params[0], p=params[1])
 
     def calculate_nll(self, x, x_out, params):
         if(self.generative_model == 'bernoulli'):
-            return torch.sum(x * torch.log(x_out) + (1-x) * torch.log(1-x_out))
+            return nn.functional.binary_cross_entropy(params[0], x, reduction='mean')
+            # return -torch.sum(x * torch.log(x_out) + (1-x) * torch.log(1-x_out))
         
         elif(self.generative_model == 'gaussian'):
-            return torch.exp(-0.5*(x - params[0])**2 / params[1]) / (2*params[1]*torch.pi)
+            return -torch.exp(-0.5*(x - params[0])**2 / params[1]) / (2*params[1]*torch.pi)
         
         elif(self.generative_model == 'nb'):
             pass
 
-    def elbo_loss(self, z_means, z_vars, generative_params, x, x_out):
+    def elbo_loss(self, z_means, z_logsigmas, generative_params, x, x_out):
         """
         """
         # KL divergence between true and approximate prior
         # equivalent to a regularization term
         # see eq. 10 from Kingma and Welling, 2014
-        KL_divergence = 0.5 * torch.sum(1 + torch.log(vars**2) - z_means**2 - z_vars**2)
+        KL_divergence = -(0.5 * torch.mean(torch.sum(1 + z_logsigmas - z_means**2 - torch.exp(z_logsigmas), dim=-1)))
 
         # negative log-likelihood of generated data
         # equivalent to reconstruction loss
         nll = self.calculate_nll(x, x_out, generative_params)
 
-        # negative because we are minimizing loss
-        return -(KL_divergence + nll)
+        # negative KL because we are minimizing loss
+        return (nll, KL_divergence)
 
     def forward(self, x, condition_labels=None):
         # append condition labels if relevant (may be continuous)
@@ -182,8 +180,9 @@ class VAE(nn.Module):
 
         # multivariate Gaussian prior
         # generate means and variances for latent variables z
-        (means, vars) = self.encoder(x)
-        z = means + vars * torch.normal(mean=0, std=1, size=vars.shape) #+ self.batch_offset
+        (means, logsigmas) = self.encoder(x)
+        stds = torch.exp(0.5*logsigmas)
+        z = means + stds * torch.normal(mean=0, std=1, size=stds.shape) #+ self.batch_offset
 
         # append condition labels if relevant (may be continuous)
         if(self.is_conditional):
@@ -196,6 +195,7 @@ class VAE(nn.Module):
         x_out = self.generate_data(generative_model_params)
 
         # calculate loss
-        elbo = self.elbo_loss(means, vars, x, x_out)
+        (nll, KL_divergence) = self.elbo_loss(means, logsigmas, generative_model_params, x, x_out)
+        elbo = nll + 1e-6 * KL_divergence
 
-        return x_out, elbo
+        return x_out, generative_model_params, elbo
