@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 class Encoder(nn.Module):
     """
@@ -45,7 +46,7 @@ class Decoder(nn.Module):
     Conditional: p(x|z,c)
     Auto-regressive: p(x_i|z,x_{j<i})
     """
-    def __init__(self, z_dim, n_features, layer_sizes, generative_model, is_autoregressive):
+    def __init__(self, z_dim, n_features, layer_sizes, generative_model, is_autoregressive, is_conditional):
         """
         n_features (int): number of input features per observation
         z_dim (int): number of latent variables
@@ -53,9 +54,16 @@ class Decoder(nn.Module):
         is_autoregressive (bool): 
         """
         super(Decoder, self).__init__()
-        n_layers = len(layer_sizes)
+        self.n_features = n_features
         layer_sizes.reverse() # for symmetric decoder
         self.is_autoregressive = is_autoregressive
+        self.is_conditional = is_conditional
+
+        # add full-dimension autoregressive layer (to be masked to enforce auto-regressive condition)
+        if(self.is_autoregressive):
+            layer_sizes.append(n_features)
+
+        n_layers = len(layer_sizes)
 
         self.model_layers = nn.ModuleList()
 
@@ -63,6 +71,7 @@ class Decoder(nn.Module):
         self.model_layers.append(nn.Linear(z_dim, layer_sizes[0]))
         self.model_layers.append(nn.ReLU())
         
+        # add hidden layers
         if(n_layers>1):
             for i_layer in range(n_layers-1):
                 self.model_layers.append(nn.Linear(layer_sizes[i_layer], layer_sizes[i_layer+1]))
@@ -85,17 +94,36 @@ class Decoder(nn.Module):
         elif(generative_model == 'bernoulli'):
             self.output_layers['p'] = nn.Linear(layer_sizes[-1], n_features)
             self.output_activations['p'] = nn.Sigmoid()
-
-    def autoregressive_mask(self):
-        pass
-
-    def forward(self, x):
-        for model_layer in self.model_layers:
-            x = model_layer(x)
         
+        # set initial mask for autoregressive layer weights
+        self.update_autoregressive_mask()
+
+    def update_autoregressive_mask(self):
         if(self.is_autoregressive):
+            # random binary mask by permutation
+            mask = torch.tril(torch.ones((self.n_features,self.n_features)))
+            permute_idx = torch.randperm(self.n_features)
+            mask = mask[permute_idx,:]
+
+            # apply mask to each output linear layer weight matrix
+            for output_layer in self.output_layers.values():
+                output_layer.register_buffer('autoregressive_mask', mask)
+                output_layer.weight = nn.Parameter(output_layer.autoregressive_mask * output_layer.weight)
+        else:
             pass
 
+    def forward(self, x, condition_labels=None):
+        """
+        """
+        # append condition labels if relevant (may be continuous)
+        if(self.is_conditional):
+            x = torch.concat((x, condition_labels), dim=1)
+
+        # pass sample from latent space through hidden layers
+        for model_layer in self.model_layers:
+            x = model_layer(x)
+
+        # produce parameters of generative model
         outs = []
         for (param, output_layer) in self.output_layers.items():
             x_out = output_layer(x)
@@ -106,7 +134,7 @@ class Decoder(nn.Module):
         return outs
 
 class VAE(nn.Module):
-    def __init__(self, n_features, z_dim, layer_sizes, activation=None, generative_model='gaussian', n_batches=1, is_autoregressive=False, is_conditional=False, seed=0):
+    def __init__(self, n_features, z_dim, layer_sizes, activation=None, generative_model='gaussian', n_batches=1, kl_weight=1e-3, is_autoregressive=False, is_conditional=False, seed=0):
         """
         n_features (int): number of input features per observation
         z_dim (int): number of latent variables
@@ -122,6 +150,7 @@ class VAE(nn.Module):
         self.input_dim = n_features
         self.z_dim = z_dim
         self.generative_model = generative_model
+        self.kl_weight = kl_weight
         self.is_autoregressive = is_autoregressive
         self.is_conditional = is_conditional
 
@@ -129,7 +158,7 @@ class VAE(nn.Module):
         self.encoder = Encoder(n_features, z_dim, layer_sizes)
 
         # define decoder network
-        self.decoder = Decoder(z_dim, n_features, layer_sizes, generative_model, is_autoregressive)
+        self.decoder = Decoder(z_dim, n_features, layer_sizes, generative_model, is_autoregressive, is_conditional)
 
         # latent batch offset vector
         if(n_batches>1):
@@ -149,7 +178,7 @@ class VAE(nn.Module):
 
     def calculate_nll(self, x, x_out, params):
         if(self.generative_model == 'bernoulli'):
-            return nn.functional.binary_cross_entropy(params[0], x, reduction='mean')
+            return F.binary_cross_entropy(params[0], x, reduction='mean')
             # return -torch.sum(x * torch.log(x_out) + (1-x) * torch.log(1-x_out))
         
         elif(self.generative_model == 'gaussian'):
@@ -184,18 +213,14 @@ class VAE(nn.Module):
         stds = torch.exp(0.5*logsigmas)
         z = means + stds * torch.normal(mean=0, std=1, size=stds.shape) #+ self.batch_offset
 
-        # append condition labels if relevant (may be continuous)
-        if(self.is_conditional):
-            z = torch.concat((z, condition_labels), dim=1)
-
         # generate observation based on sample from latent distribution
-        generative_model_params = self.decoder(z)
+        generative_model_params = self.decoder(z, condition_labels)
 
         # generate data
         x_out = self.generate_data(generative_model_params)
 
         # calculate loss
         (nll, KL_divergence) = self.elbo_loss(means, logsigmas, generative_model_params, x, x_out)
-        elbo = nll + 1e-6 * KL_divergence
+        elbo = nll + self.kl_weight * KL_divergence
 
         return x_out, generative_model_params, elbo
