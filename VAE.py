@@ -6,7 +6,7 @@ class Encoder(nn.Module):
     """
     Implements the approximate posterior q(z|x)
     """
-    def __init__(self, n_features, z_dim, layer_sizes):
+    def __init__(self, n_features, z_dim, layer_sizes, n_conditions):
         """
         n_features (int): number of input features per observation
         z_dim (int): number of latent variables
@@ -46,7 +46,7 @@ class Decoder(nn.Module):
     Conditional: p(x|z,c)
     Auto-regressive: p(x_i|z,x_{j<i})
     """
-    def __init__(self, z_dim, n_features, layer_sizes, generative_model, is_autoregressive, is_conditional):
+    def __init__(self, z_dim, n_features, layer_sizes, generative_model, is_autoregressive, n_conditions):
         """
         n_features (int): number of input features per observation
         z_dim (int): number of latent variables
@@ -57,7 +57,7 @@ class Decoder(nn.Module):
         self.n_features = n_features
         layer_sizes.reverse() # for symmetric decoder
         self.is_autoregressive = is_autoregressive
-        self.is_conditional = is_conditional
+        self.n_conditions = n_conditions
 
         # add full-dimension autoregressive layer (to be masked to enforce auto-regressive condition)
         if(self.is_autoregressive):
@@ -99,15 +99,19 @@ class Decoder(nn.Module):
         self.update_autoregressive_mask()
 
     def update_autoregressive_mask(self):
+        """
+        Updates autoregressive mask applied to final layer weight matrix.
+        """
         if(self.is_autoregressive):
             # random binary mask by permutation
-            mask = torch.tril(torch.ones((self.n_features,self.n_features)))
+            mask = torch.triu(torch.ones((self.n_features,self.n_features)), diagonal=1)
             permute_idx = torch.randperm(self.n_features)
             mask = mask[permute_idx,:]
 
             # apply mask to each output linear layer weight matrix
             for output_layer in self.output_layers.values():
                 output_layer.register_buffer('autoregressive_mask', mask)
+                # output_layer.register_buffer('weight_old', output_layer.weight)
                 output_layer.weight = nn.Parameter(output_layer.autoregressive_mask * output_layer.weight)
         else:
             pass
@@ -116,7 +120,7 @@ class Decoder(nn.Module):
         """
         """
         # append condition labels if relevant (may be continuous)
-        if(self.is_conditional):
+        if(self.n_conditions>0):
             x = torch.concat((x, condition_labels), dim=1)
 
         # pass sample from latent space through hidden layers
@@ -134,7 +138,7 @@ class Decoder(nn.Module):
         return outs
 
 class VAE(nn.Module):
-    def __init__(self, n_features, z_dim, layer_sizes, activation=None, generative_model='gaussian', n_batches=1, kl_weight=1e-3, is_autoregressive=False, is_conditional=False, seed=0):
+    def __init__(self, n_features, z_dim, layer_sizes, activation=None, generative_model='gaussian', n_batches=1, kl_weight=1e-3, is_autoregressive=False, n_conditions=0, seed=0):
         """
         n_features (int): number of input features per observation
         z_dim (int): number of latent variables
@@ -152,13 +156,13 @@ class VAE(nn.Module):
         self.generative_model = generative_model
         self.kl_weight = kl_weight
         self.is_autoregressive = is_autoregressive
-        self.is_conditional = is_conditional
+        self.n_conditions = n_conditions
 
         # define encoder network
-        self.encoder = Encoder(n_features, z_dim, layer_sizes)
+        self.encoder = Encoder(n_features, z_dim, layer_sizes, n_conditions)
 
         # define decoder network
-        self.decoder = Decoder(z_dim, n_features, layer_sizes, generative_model, is_autoregressive, is_conditional)
+        self.decoder = Decoder(z_dim, n_features, layer_sizes, generative_model, is_autoregressive, n_conditions)
 
         # latent batch offset vector
         if(n_batches>1):
@@ -204,17 +208,17 @@ class VAE(nn.Module):
 
     def forward(self, x, condition_labels=None):
         # append condition labels if relevant (may be continuous)
-        if(self.is_conditional):
+        if(self.n_conditions>0):
             x = torch.concat((x, condition_labels), dim=1)
 
         # multivariate Gaussian prior
         # generate means and variances for latent variables z
         (means, logsigmas) = self.encoder(x)
         stds = torch.exp(0.5*logsigmas)
-        z = means + stds * torch.normal(mean=0, std=1, size=stds.shape) #+ self.batch_offset
+        self.z = means + stds * torch.normal(mean=0, std=1, size=stds.shape) #+ self.batch_offset
 
         # generate observation based on sample from latent distribution
-        generative_model_params = self.decoder(z, condition_labels)
+        generative_model_params = self.decoder(self.z, condition_labels)
 
         # generate data
         x_out = self.generate_data(generative_model_params)
