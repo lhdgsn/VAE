@@ -105,15 +105,18 @@ class Decoder(nn.Module):
             
             self.update_autoregressive_mask()
 
-    def update_autoregressive_mask(self):
+    def update_autoregressive_mask(self, unmask=False):
         """
         Updates autoregressive mask applied to final layer weight matrix.
         """
         if(self.is_autoregressive):
-            # random binary mask by permutation
-            mask = torch.tril(torch.ones((self.n_features,self.n_features)), diagonal=0)
-            permute_idx = torch.randperm(self.n_features)
-            mask = mask[permute_idx,:]
+            if(unmask):
+                mask = torch.ones((self.n_features,self.n_features))    
+            else:
+                # random binary mask by permutation
+                mask = torch.tril(torch.ones((self.n_features,self.n_features)), diagonal=0)
+                permute_idx = torch.randperm(self.n_features)
+                mask = mask[permute_idx,:]
 
             # apply mask to each output linear layer weight matrix
             for out_name, out_layer in self.output_layers.items():
