@@ -92,11 +92,18 @@ class Decoder(nn.Module):
             self.output_activations['p'] = nn.Sigmoid()
         
         elif(generative_model == 'bernoulli'):
-            self.output_layers['p'] = nn.Linear(layer_sizes[-1], n_features)
+            self.output_layers['p'] = nn.Linear(layer_sizes[-1], n_features, bias=False)
             self.output_activations['p'] = nn.Sigmoid()
         
-        # set initial mask for autoregressive layer weights
-        self.update_autoregressive_mask()
+        # init buffers for autoregressive layer weights
+        if(self.is_autoregressive):
+            for out_name, out_layer in self.output_layers.items():
+                # add buffer (no gradient) to store full weight matrix so as to not lose masked elements
+                out_layer.register_buffer(f'saved_weight_{out_name}', out_layer.weight.clone().detach())
+                # add buffer to store autoregressive mask
+                out_layer.register_buffer('autoregressive_mask', torch.ones((self.n_features,self.n_features)))
+            
+            self.update_autoregressive_mask()
 
     def update_autoregressive_mask(self):
         """
@@ -104,17 +111,25 @@ class Decoder(nn.Module):
         """
         if(self.is_autoregressive):
             # random binary mask by permutation
-            mask = torch.triu(torch.ones((self.n_features,self.n_features)), diagonal=1)
+            mask = torch.tril(torch.ones((self.n_features,self.n_features)), diagonal=0)
             permute_idx = torch.randperm(self.n_features)
             mask = mask[permute_idx,:]
 
             # apply mask to each output linear layer weight matrix
-            for output_layer in self.output_layers.values():
-                output_layer.register_buffer('autoregressive_mask', mask)
-                # output_layer.register_buffer('weight_old', output_layer.weight)
-                output_layer.weight = nn.Parameter(output_layer.autoregressive_mask * output_layer.weight)
-        else:
-            pass
+            for out_name, out_layer in self.output_layers.items():
+                old_mask = out_layer.autoregressive_mask # mask used for previous update step
+                masked_weight = out_layer.weight.clone().detach() # masked weight matrix from previous update step
+                saved_weight = out_layer._buffers[f'saved_weight_{out_name}'] # complete saved weight matrix
+
+                # update saved weight matrix to include most recent update
+                saved_weight = masked_weight + (1 - old_mask) * saved_weight
+                out_layer._buffers[f'saved_weight_{out_name}'] = saved_weight
+
+                # update mask
+                out_layer.autoregressive_mask = mask
+
+                # set new masked weight matrix
+                out_layer.weight = nn.Parameter(mask * saved_weight)
 
     def forward(self, x, condition_labels=None):
         """
