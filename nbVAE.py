@@ -31,47 +31,82 @@ class Encoder(nn.Module):
         # Calculate latent sigma from transformed data
         sigma = torch.exp(self.linear_sigma(h_))
 
-        # Re-parameterize the latent variables as a standard Normal
+        # Re-parameterize the latent variables (not as a standard Normal)
         z = mu + sigma*self.N.sample(mu.shape)
 
         return z, mu, sigma, library
 
 # Define the decoder module (GENERATIVE)
 class Decoder(nn.Module):
-    def __init__(self, output_size, hidden_dims, latent_dims):
+    def __init__(self, output_size, hidden_dims, latent_dims, autoregressive=False):
         super(Decoder, self).__init__()
+
+        self.is_autoregressive = autoregressive
+        self.output_size = output_size
 
         # First hidden layer
         self.linear1 = nn.Linear(latent_dims, hidden_dims)
+        # Autoregressive layer
+        parameter_layer_input = hidden_dims
+        if autoregressive:
+            self.linear_ar = nn.Linear(hidden_dims, output_size)
+            parameter_layer_input = output_size
         # Layer for negative-binomial scale parameter
-        self.linear_scale = nn.Linear(hidden_dims, output_size)
+        self.linear_scale = nn.Linear(parameter_layer_input, output_size)
+        self.linear_theta = nn.Linear(parameter_layer_input, output_size)
 
-        # Treat theta as a learned parameter
-        self.log_theta = torch.nn.Parameter(torch.randn(output_size))
+        if autoregressive:
+            for param_layer in [self.linear_scale, self.linear_theta]:
+                param_layer.register_buffer("saved_weight", param_layer.weight.clone().detach())
+                param_layer.register_buffer("autoregressive_mask", torch.ones((output_size, output_size)))
+            self.update_autoregressive_mask()
+    
+    def update_autoregressive_mask(self):
+        if self.is_autoregressive:
+            mask = torch.triu(torch.ones((self.output_size, self.output_size)), diagonal=1)
+            permute_idx = torch.randperm(self.output_size)
+            mask = mask[permute_idx,:]
+            
+            for param_layer in [self.linear_scale, self.linear_theta]:
+                old_mask = param_layer.autoregressive_mask
+                masked_weight = param_layer.weight.clone().detach()
+                saved_weight = param_layer._buffers["saved_weight"]
+
+                saved_weight = masked_weight + (1-old_mask) * saved_weight
+                param_layer._buffers["saved_weight"] = saved_weight
+
+                param_layer.autoregressive_mask = mask
+                param_layer.weight = nn.Parameter(mask * saved_weight)
 
     def forward(self, z, library):
+        self.update_autoregressive_mask()
         # Send the latent data representation through the first hidden layer
         h_ = F.relu(self.linear1(z))
 
+        # Send through the autoregressive layer
+        if self.is_autoregressive:
+            h_ = F.relu(self.linear_ar(h_))
+
         # Calculate scale parameter for the data distribution
         scale = torch.sigmoid(self.linear_scale(h_))
+        log_theta = torch.sigmoid(self.linear_theta(h_))
         # The rate parameter is just the scale multiplied by the total library size for each cell
         # (each gene per cell has its own rate parameter, 
         # which will help determine the probability of a success for each trial)
         rate = scale * library
         # Theta is the number of "failures" after which to stop our Bernoulli trials
-        theta = torch.exp(self.log_theta)
+        theta = torch.exp(log_theta)
 
         return rate, theta
 
 # Define the full VAE
 class VAE(nn.Module):
-    def __init__(self, input_size, hidden_dims=128, latent_dims=10):
+    def __init__(self, input_size, hidden_dims=128, latent_dims=10, autoregressive=False):
         super(VAE, self).__init__()
 
         # Define Encoder and Decoder modules
         self.encoder = Encoder(input_size, hidden_dims, latent_dims)
-        self.decoder = Decoder(input_size, hidden_dims, latent_dims)
+        self.decoder = Decoder(input_size, hidden_dims, latent_dims, autoregressive=autoregressive)
 
     def forward(self, x):
         # Perform inference on x using Encoder to generate latent z & params
