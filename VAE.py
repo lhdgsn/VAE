@@ -104,6 +104,9 @@ class Decoder(nn.Module):
             self.output_layers['p'] = nn.Linear(layer_sizes[-1], n_features, bias=True)
             self.output_activations['p'] = nn.Sigmoid()
         
+        elif(generative_model == 'mse'):
+            self.output_layers['p'] = nn.Linear(layer_sizes[-1], n_features, bias=True)
+        
         # init buffers for autoregressive layer weights
         if(self.is_autoregressive):
             for out_name, out_layer in self.output_layers.items():
@@ -168,16 +171,15 @@ class Decoder(nn.Module):
         return outs
 
 class VAE(nn.Module):
-    def __init__(self, n_features, z_dim, layer_sizes, activation=None, generative_model='gaussian', balance_classes=False, n_batches=1, kl_weight=1e-3, is_autoregressive=False, n_conditions=0, seed=0):
+    def __init__(self, n_features, z_dim, layer_sizes, generative_model='gaussian', balance_classes=False, n_batches=1, kl_weight=1e-3, is_autoregressive=False, n_conditions=0, seed=0):
         """
         n_features (int): number of input features per observation
         z_dim (int): number of latent variables
-        layer_size (list): number of hidden units for each encoder layer
-        activation:
-        generative_model (string): data generative model, parametrized by decoder neural network ('gaussian', 'bernoulli', 'nb', 'zinb')
+        layer_size (list): list of number of hidden units for each encoder layer
+        generative_model (string): data generative model, parametrized by decoder neural network ('gaussian', 'bernoulli', 'nb', 'mse')
         n_batches (int): number of batches present in data (default 1)
-        is_autoregressive (bool): 
-        is_conditional (bool):
+        is_autoregressive (bool): flag for autoregressive model (experimental)
+        is_conditional (bool): flag for conditional VAE (pass condition labels to forward method
         seed (int): seed for random number generator
         """
         super(VAE, self).__init__()
@@ -210,6 +212,9 @@ class VAE(nn.Module):
         
         elif(self.generative_model == 'nb'):
             return torch.negative_binomial(n=params[0], p=params[1])
+        
+        elif(self.generative_model == 'mse'):
+            return params[0]
 
     def calculate_nll(self, x, x_out, params):
         if(self.generative_model == 'bernoulli'):
@@ -220,6 +225,9 @@ class VAE(nn.Module):
         
         elif(self.generative_model == 'nb'):
             pass
+    
+        elif(self.generative_model == 'mse'):
+            return F.mse_loss(x, x_out, reduction='none')
 
     def elbo_loss(self, z_means, z_logsigmas, generative_params, x, x_out):
         """
@@ -237,6 +245,20 @@ class VAE(nn.Module):
         return (nll, KL_divergence)
 
     def forward(self, x, condition_labels=None, n_masks=1):
+        """
+        Inputs
+        x: samples [batchsize, sample_dim]
+        condition_labels: condition labels [batchsize, n_conditions]
+
+        Returns
+        x_out: generative model output, which is a random sample drawn from distribution
+            parametrized by generative_model_params
+        generative_model_params: parameters of generative model
+            bernoulli: [mean]
+            gaussian: [mean, log_std]
+            mse: [reconstruction] - non-stochastic model so no parameters
+        elbo: ELBO loss (sum of reconstruction loss and KL divergence)
+        """
         # multivariate Gaussian prior
         # generate means and variances for latent variables z
         (means, logsigmas) = self.encoder(x, condition_labels)
@@ -255,6 +277,6 @@ class VAE(nn.Module):
         if(self.balance_classes):
             pass
 
-        elbo = [torch.mean(nll), self.kl_weight * KL_divergence]
+        elbo = torch.mean(nll) + self.kl_weight * KL_divergence
 
         return x_out, generative_model_params, elbo
